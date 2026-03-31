@@ -3,8 +3,8 @@ import logging
 import asyncio
 import tempfile
 import threading
+import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from groq import Groq
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.constants import ChatAction
@@ -17,11 +17,10 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
-groq_client = Groq(api_key=GROQ_API_KEY)
 
-
-# ── Health check server (keeps Render alive) ──────────────────────────────────
+# ── Health check server ───────────────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -30,7 +29,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, *args):
-        pass  # Silence access logs
+        pass
 
 
 def run_health_server():
@@ -40,17 +39,28 @@ def run_health_server():
     server.serve_forever()
 
 
-# ── Transcription ─────────────────────────────────────────────────────────────
+# ── Transcription via raw HTTP (no Groq SDK) ──────────────────────────────────
 
 def transcribe_sync(file_path: str) -> str:
-    with open(file_path, "rb") as audio_file:
-        transcription = groq_client.audio.transcriptions.create(
-            file=(os.path.basename(file_path), audio_file),
-            model="whisper-large-v3-turbo",
-            response_format="text",
-            language="ru",
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    filename = os.path.basename(file_path)
+
+    with httpx.Client(timeout=60) as client:
+        response = client.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (filename, data)},
+            data={
+                "model": "whisper-large-v3-turbo",
+                "response_format": "text",
+                "language": "ru",
+            },
         )
-    return transcription.strip()
+
+    response.raise_for_status()
+    return response.text.strip()
 
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
@@ -81,9 +91,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await file.download_to_drive(tmp_path)
 
-        text = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: transcribe_sync(tmp_path)
-        )
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, transcribe_sync, tmp_path)
 
         if text:
             await message.reply_text(
@@ -106,18 +115,29 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
-    # Start health server in background thread
-    thread = threading.Thread(target=run_health_server, daemon=True)
-    thread.start()
-
-    # Start Telegram bot
+async def run_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_voice))
 
     logger.info("Bot started!")
-    app.run_polling(allowed_updates=["message"])
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=["message"])
+
+    await asyncio.Event().wait()
+
+
+def main():
+    thread = threading.Thread(target=run_health_server, daemon=True)
+    thread.start()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_bot())
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
